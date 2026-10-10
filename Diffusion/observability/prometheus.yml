@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s     # jobs take ~40s; 5s gives ~8 samples per job
+
+scrape_configs:
+  - job_name: api
+    static_configs: [{targets: ['api:8000']}]
+  - job_name: worker
+    static_configs: [{targets: ['worker:9100']}]

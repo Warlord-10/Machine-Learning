@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+celery
+redis
+sqlalchemy
+psycopg[binary]
+
+# inference (cascade_pipeline.py) — no TensorFlow at runtime
+onnxruntime
+numpy
+pillow
+
+# observability
+prometheus-client
+prometheus-fastapi-instrumentator

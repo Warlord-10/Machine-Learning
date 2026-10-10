@@ -1,8 +1,11 @@
 models
 weights
 datasets
+__pycache__
 
 /*.md
 
 .DS_Store
 .venv
+.env
+cascade_output/

@@ -1,0 +1,11 @@
+models/
+weights/
+datasets/
+cascade_output/
+scripts/
+__pycache__/
+**/__pycache__/
+*.ipynb
+*.db
+serving/bucket/
+.DS_Store
