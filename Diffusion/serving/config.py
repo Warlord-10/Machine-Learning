@@ -10,8 +10,9 @@ DIFFUSION_DIR = SERVING_DIR.parent
 
 # --- infra ---
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9100"))  # worker's /metrics (api uses 8000)
-DB_URL = os.getenv("DB_URL", f"sqlite:///{SERVING_DIR / 'jobs.db'}")
+DB_URL = os.getenv("DB_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/diffusion")
 
 # Local folder that stands in for an S3 bucket. Swap `storage.py` for real S3 later.
 STORAGE_DIR = Path(os.getenv("STORAGE_DIR", str(SERVING_DIR / "bucket")))
@@ -22,7 +23,7 @@ RATE_LIMIT = int(os.getenv("RATE_LIMIT", "3"))          # jobs admitted...
 RATE_WINDOW_S = int(os.getenv("RATE_WINDOW_S", "60"))   # ...per this rolling window
 
 # --- job lifecycle ---
-JOB_TIMEOUT_S = int(os.getenv("JOB_TIMEOUT_S", "300"))  # Celery hard limit + active-slot TTL
+JOB_TIMEOUT_S = int(os.getenv("JOB_TIMEOUT_S", "300"))  # checked between sampling steps
 TERMINAL_TTL_S = int(os.getenv("TERMINAL_TTL_S", str(15 * 60)))  # cache warmth after finish
 
 # --- generation defaults ---
@@ -33,6 +34,15 @@ DDIM_STEPS = int(os.getenv("DDIM_STEPS", "25"))        # base model (from noise)
 # refiner, not a generator. 50/25/15 measured indistinguishable; 6 is the choice.
 UP_DDIM_STEPS = int(os.getenv("UP_DDIM_STEPS", "6"))
 MAX_LABELS = int(os.getenv("MAX_LABELS", "4"))     # cap batch size per request
+
+# --- dynamic batching (worker) ---
+# Jobs are packed into one model pass of up to BATCH_MAX_IMAGES images. A batch waits at
+# most BATCH_MAX_WAIT_MS for more jobs: that's the extra latency a lone job can pay.
+BATCH_MAX_IMAGES = int(os.getenv("BATCH_MAX_IMAGES", "4"))
+BATCH_MAX_WAIT_MS = int(os.getenv("BATCH_MAX_WAIT_MS", "100"))
+
+# --- long polling (api) ---
+LONG_POLL_MAX_S = int(os.getenv("LONG_POLL_MAX_S", "25"))  # under typical 60s proxy timeouts
 
 # --- admission control (aggregate load, NOT per-client) ---
 # The per-IP rate limit bounds ONE client. It does nothing about many compliant

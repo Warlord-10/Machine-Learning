@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
-celery
+aio-pika
 redis
-sqlalchemy
+sqlalchemy[asyncio]
 psycopg[binary]
 
 # inference (cascade_pipeline.py) — no TensorFlow at runtime

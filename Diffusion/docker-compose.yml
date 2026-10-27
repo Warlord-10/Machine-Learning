@@ -11,8 +11,9 @@ x-app: &app
     - ./models:/app/models:ro
     - data:/data
   depends_on:
-    redis: {condition: service_healthy}
-    postgres: {condition: service_healthy}
+    redis: { condition: service_healthy }
+    postgres: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
 
 services:
   redis:
@@ -23,13 +24,24 @@ services:
       interval: 5s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    restart: unless-stopped
+    ports: ["15673:15672"] # management UI (guest/guest); host :15672 is taken by folio-rabbitmq
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq # durable queues + persistent messages survive restarts
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 5
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: diffusion
-    ports: ["5432:5432"]   # so a desktop GUI can connect directly
+    ports: ["5432:5432"] # so a desktop GUI can connect directly
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -42,42 +54,52 @@ services:
     ports: ["8000:8000"]
     healthcheck:
       # /healthz, not /readyz: a dependency blip must not restart a healthy API.
-      test: ["CMD", "python", "-c",
-             "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')",
+        ]
       interval: 10s
       start_period: 20s
       retries: 3
 
   worker:
     <<: *app
-    command: celery -A celery_app worker --loglevel=info --concurrency=1
+    command: python rabbitmq.py # one job at a time (prefetch=1); scale with --scale worker=N
     healthcheck:
-      # Cheap liveness: the metrics port only binds after the ONNX sessions load.
-      test: ["CMD", "python", "-c",
-             "import urllib.request;urllib.request.urlopen('http://localhost:9100/metrics')"]
+      # Cheap liveness: the metrics port binds once the worker has started.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request;urllib.request.urlopen('http://localhost:9100/metrics')",
+        ]
       interval: 15s
       start_period: 60s
       retries: 3
 
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    ports: ["9090:9090"]
-    volumes:
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - promdata:/prometheus
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   restart: unless-stopped
+  #   ports: ["9090:9090"]
+  #   volumes:
+  #     - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - promdata:/prometheus
 
-  grafana:
-    image: grafana/grafana:latest
-    restart: unless-stopped
-    ports: ["3000:3000"]
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"     # local-only; no login prompt
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-    volumes:
-      - ./observability/grafana-datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
-      - grafanadata:/var/lib/grafana
-    depends_on: [prometheus]
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   restart: unless-stopped
+  #   ports: ["3000:3000"]
+  #   environment:
+  #     GF_AUTH_ANONYMOUS_ENABLED: "true"     # local-only; no login prompt
+  #     GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+  #   volumes:
+  #     - ./observability/grafana-datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+  #     - grafanadata:/var/lib/grafana
+  #   depends_on: [prometheus]
 
   # DB browser: docker compose --profile debug up -d adminer  -> localhost:8080
   adminer:
@@ -87,11 +109,12 @@ services:
     environment:
       ADMINER_DEFAULT_SERVER: postgres
     depends_on:
-      postgres: {condition: service_healthy}
+      postgres: { condition: service_healthy }
 
 volumes:
   # Generated PNGs (the S3 stand-in). DB lives in pgdata now.
   data:
   pgdata:
-  promdata:
-  grafanadata:
+  rabbitdata:
+  # promdata:
+  # grafanadata:

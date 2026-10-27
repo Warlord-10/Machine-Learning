@@ -1,22 +1,15 @@
-"""Production-grade cascading diffusion inference pipeline (ONNX Runtime only).
+"""Cascading diffusion inference on ONNX Runtime (no TensorFlow at runtime).
 
-Stage 1: base model      -> 64x64  class-conditioned image
-Stage 2: upsampler model -> 256x256, conditioned on a bicubic upscale of stage 1
+Two class-conditioned models run in sequence:
+  1. Base model      noise -> 64x64 image
+  2. Upsample model  noise -> 256x256 image, guided by a bicubic upscale of stage 1
 
-No TensorFlow at runtime — inference runs entirely on onnxruntime + numpy.
-(TF is still used in inference.ipynb to *re-export* the .onnx files from Keras
-weights; that is a build step, not a serving dependency.)
+Each model was trained with its own cosine noise schedule (1000 and 400 timesteps),
+so each carries its own `NoiseSchedule`.
 
-The two models do NOT share hyper-parameters:
-  - base:      IMAGE_SIZE=64,  TIMESTEPS=1000, inputs [image, time, label]
-  - upsampler: IMAGE_SIZE=256, TIMESTEPS=400,  inputs [image(6ch), time, blur, label]
-Each therefore gets its own cosine noise schedule.
-
-Run it: `python3 cascade_pipeline.py` — configuration lives in `main()`.
-Use it as a library:
-
-    pipe = CascadePipeline(CascadeConfig())
-    result = pipe.generate(labels=[0, 1], seed=42)   # 0=dog, 1=cat
+Usage:
+    pipeline = CascadePipeline(CascadeConfig())
+    result = pipeline.generate(labels=[DOG, CAT], seed=42)
     result.save(Path("out"))
 """
 
@@ -24,354 +17,259 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import onnxruntime as rt
+import onnxruntime as ort
 from PIL import Image
 
 logger = logging.getLogger("cascade")
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+CHANNELS = 3
+DOG, CAT = 0, 1
+SAMPLERS = ("ddim", "ddpm")
 
 
-class JobCancelled(Exception):
-    """Raised from the sampling loop when should_cancel() fires (superseded job)."""
-
-
-def _stage_timer(on_stage):
-    """Context manager factory: times a block and reports it. No-op if on_stage is None.
-    Deliberately reports on the exception path too — a cancelled stage's partial time
-    is real work done, and hiding it would understate cost under load."""
-    from contextlib import contextmanager, nullcontext
-    from time import perf_counter
-
-    if on_stage is None:
-        return lambda _name: nullcontext()
-
-    @contextmanager
-    def timer(name):
-        t0 = perf_counter()
-        try:
-            yield
-        finally:
-            on_stage(name, perf_counter() - t0)
-
-    return timer
-
-
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class CascadeConfig:
-    """All knobs for the pipeline. Edit in main(); not a CLI."""
-
-    channels: int = 3
+    # Env-overridable so fp32/fp16/int8 exports can be swapped without a code change.
+    base_model_path: Path = Path(os.getenv("BASE_MODEL", MODELS_DIR / "base_model.onnx"))
+    upsample_model_path: Path = Path(os.getenv("UP_MODEL", MODELS_DIR / "upsample_model.onnx"))
 
     base_image_size: int = 64
+    upsample_image_size: int = 256
+    # Must match training; these define each model's noise schedule.
     base_timesteps: int = 1000
-    # Env-overridable so fp32/fp16/int8 variants can be A/B'd without a code edit
-    # (e.g. UP_MODEL=/app/models/upsample_model.fp16.onnx). Resolved at import.
-    base_model: Path = Path(os.getenv("BASE_MODEL", SCRIPT_DIR / "models" / "base_model.onnx"))
+    upsample_timesteps: int = 400
 
-    up_image_size: int = 256
-    up_timesteps: int = 400
-    up_model: Path = Path(os.getenv("UP_MODEL", SCRIPT_DIR / "models" / "upsample_model.onnx"))
-
-    # Sampler: "ddpm" (full, high quality, slow) or "ddim" (few-step, deterministic).
-    # DDIM at ~50 steps is the production default: ~20x fewer model calls, near-identical quality.
+    # "ddim": few deterministic steps (production). "ddpm": every timestep, slow.
     sampler: str = "ddim"
-    # base model, from pure noise. 25 measured indistinguishable from 50 (2026-08-02,
-    # 31.7 dB, same subjects); 15 starts corrupting eyes. Env: DDIM_STEPS.
-    ddim_steps: int = int(os.getenv("DDIM_STEPS", "25"))
-    # Upsampler steps are SEPARATE and deliberately fewer. It is a refiner conditioned
-    # on a good 64x64 guide, not a generator from noise, so it converges in far fewer
-    # steps — and at 83% of total cost it is the only stage where steps buy latency.
-    # 6 chosen from the 2026-08-02 sweep: 8.3x fewer model calls in the stage that
-    # dominates cost. 50/25/15 were mutually indistinguishable on AFHQ dog/cat.
-    # Set None to fall back to ddim_steps (the old single-knob behaviour).
-    up_ddim_steps: int | None = int(os.getenv("UP_DDIM_STEPS", "6"))
-    ddim_eta: float = 0.0  # 0 = deterministic DDIM; ->1 recovers DDPM-like stochasticity
+    # DDIM steps per stage. Base: 25 is indistinguishable from 50, 15 corrupts eyes.
+    # Upsample: it refines a good 64x64 guide and is ~83% of the cost; 6 is
+    # indistinguishable from 50. Measured 2026-08-02, see serving/JOURNAL.md.
+    base_steps: int = int(os.getenv("DDIM_STEPS", "25"))
+    upsample_steps: int = int(os.getenv("UP_DDIM_STEPS", "6"))
+    ddim_eta: float = 0.0  # 0 = deterministic; 1 = DDPM-level noise
 
-    @property
-    def up_steps_effective(self) -> int:
-        return self.ddim_steps if self.up_ddim_steps is None else self.up_ddim_steps
+    # Preference order; unavailable providers are skipped and CPU is always the fallback.
+    # CoreML is left out on purpose: it compiles our dynamic-batch graphs but fails at runtime.
+    providers: tuple[str, ...] = ("CUDAExecutionProvider", "CPUExecutionProvider")
 
-    # Preference order; unavailable ones are skipped, CPU is always appended.
-    # CoreML is intentionally NOT default: its EP can't reliably run dynamic-batch
-    # graphs (compiles but fails at runtime). Use CUDA on a server; CPU locally.
-    # For CoreML specifically, export a static-shape fp16 MLProgram instead.
-    providers: tuple[str, ...] = (
-        "CUDAExecutionProvider",
-        "CPUExecutionProvider",
-    )
+    def __post_init__(self) -> None:
+        if self.sampler not in SAMPLERS:
+            raise ValueError(f"sampler must be one of {SAMPLERS}, got {self.sampler!r}")
 
 
-# --------------------------------------------------------------------------- #
-# Cosine noise schedule (numpy port of the training schedule)
-# --------------------------------------------------------------------------- #
-def cosine_beta_schedule(timesteps: int) -> np.ndarray:
-    s = 0.008
-    t = np.arange(0, timesteps, dtype=np.float32)
-    phase = ((t / timesteps) + s) / (1.0 + s)
-    f_t = np.cos(phase * (np.pi / 2.0)) ** 2
-    f_0 = np.cos((s / (1.0 + s)) * (np.pi / 2.0)) ** 2
-    alpha_bar = f_t / f_0
-    alpha_bar_shifted = np.concatenate([[1.0], alpha_bar[:-1]])
-    beta = np.clip(1.0 - alpha_bar / alpha_bar_shifted, 0.0, 0.999)
-    return beta.astype(np.float32)
-
-
-class Schedule:
-    """Cosine noise schedule + DDPM/DDIM reverse steps, all in numpy."""
-
-    def __init__(self, timesteps: int):
-        self.timesteps = timesteps
-        self.beta = cosine_beta_schedule(timesteps)
-        self.alpha = 1.0 - self.beta
-        self.alpha_bar = np.cumprod(self.alpha)
-
-    def _abar(self, t: int) -> float:
-        # t < 0 denotes the clean image (alpha_bar = 1), used as DDIM's final target.
-        return float(self.alpha_bar[t]) if t >= 0 else 1.0
-
-    def ddpm_step(self, x_t: np.ndarray, pred_noise: np.ndarray, t: int,
-                  rng: np.random.Generator) -> np.ndarray:
-        """One ancestral DDPM reverse step (stochastic, full T steps)."""
-        alpha_t = self.alpha[t]
-        alpha_t_bar = self.alpha_bar[t]
-        eps_coef = (1.0 - alpha_t) / np.sqrt(1.0 - alpha_t_bar)
-        mean = (1.0 / np.sqrt(alpha_t)) * (x_t - eps_coef * pred_noise)
-        var = self.beta[t]
-        z = rng.standard_normal(x_t.shape).astype(np.float32)
-        noise_mask = 1.0 if t > 0 else 0.0  # no noise added on the final step
-        return (mean + noise_mask * np.sqrt(var) * z).astype(np.float32)
-
-    def ddim_step(self, x_t: np.ndarray, pred_noise: np.ndarray, t: int, t_prev: int,
-                  rng: np.random.Generator, eta: float = 0.0, clip: bool = True) -> np.ndarray:
-        """One DDIM reverse step from t -> t_prev (Song et al. 2021).
-
-        eta=0 is deterministic (implicit); eta=1 reproduces DDPM's noise level.
-        Jumping t->t_prev over a subsequence is what makes DDIM few-step.
-        """
-        ab_t = self._abar(t)
-        ab_prev = self._abar(t_prev)
-        # Predict x_0 from x_t and the noise estimate, then re-noise toward t_prev.
-        x0 = (x_t - np.sqrt(1.0 - ab_t) * pred_noise) / np.sqrt(ab_t)
-        if clip:
-            x0 = np.clip(x0, -1.0, 1.0)  # models trained on [-1,1]; keeps early steps stable
-        sigma = 0.0
-        if eta > 0.0:
-            sigma = eta * np.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * np.sqrt(1.0 - ab_t / ab_prev)
-        dir_coef = np.sqrt(max(1.0 - ab_prev - sigma ** 2, 0.0))
-        x_prev = np.sqrt(ab_prev) * x0 + dir_coef * pred_noise
-        if sigma > 0.0 and t_prev > 0:
-            x_prev = x_prev + sigma * rng.standard_normal(x_t.shape).astype(np.float32)
-        return x_prev.astype(np.float32)
-
-
-# --------------------------------------------------------------------------- #
-# Image helpers
-# --------------------------------------------------------------------------- #
-def bicubic_resize(img: np.ndarray, size: int) -> np.ndarray:
-    """Bicubic resize of a single HWC float image, per-channel in Pillow "F"
-    mode so the [-1, 1] range is preserved (no uint8 quantisation)."""
-    out = np.empty((size, size, img.shape[-1]), dtype=np.float32)
-    for c in range(img.shape[-1]):
-        pil = Image.fromarray(img[..., c], mode="F").resize((size, size), Image.BICUBIC)
-        out[..., c] = np.asarray(pil, dtype=np.float32)
-    return out
-
-
-def to_uint8(img: np.ndarray) -> np.ndarray:
-    """Single HWC image in [-1, 1] -> uint8 [0, 255]."""
-    return (np.clip((img + 1.0) / 2.0, 0.0, 1.0) * 255.0).round().astype(np.uint8)
-
-
-# --------------------------------------------------------------------------- #
-# Result
-# --------------------------------------------------------------------------- #
 @dataclass
 class CascadeResult:
     labels: list[int]
-    base: np.ndarray        # (N, 64, 64, 3)   in [-1, 1]
-    condition: np.ndarray   # (N, 256, 256, 3) in [-1, 1] (bicubic upscale)
-    final: np.ndarray       # (N, 256, 256, 3) in [-1, 1]
+    base_images: np.ndarray  # (N, 64, 64, 3) in [-1, 1]
+    images: np.ndarray       # (N, 256, 256, 3) in [-1, 1], the final output
 
     def save(self, out_dir: Path) -> list[Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
-        paths: list[Path] = []
-        for i, label in enumerate(self.labels):
-            path = out_dir / f"cascade_label{label}_{i}.png"
-            Image.fromarray(to_uint8(self.final[i])).save(path)
+        paths = []
+        for index, (label, image) in enumerate(zip(self.labels, self.images)):
+            path = out_dir / f"cascade_label{label}_{index}.png"
+            Image.fromarray(to_uint8(image)).save(path)
             paths.append(path)
-        logger.info("saved %d image(s) to %s", len(paths), out_dir)
         return paths
 
 
-# --------------------------------------------------------------------------- #
-# Pipeline
-# --------------------------------------------------------------------------- #
+class NoiseSchedule:
+    """Cosine noise schedule (numpy port of the training one) and the reverse steps."""
+
+    def __init__(self, timesteps: int, offset: float = 0.008):
+        self.timesteps = timesteps
+        steps = np.arange(0, timesteps, dtype=np.float32)
+        phase = ((steps / timesteps) + offset) / (1.0 + offset)
+        signal = np.cos(phase * (np.pi / 2.0)) ** 2
+        signal_at_zero = np.cos((offset / (1.0 + offset)) * (np.pi / 2.0)) ** 2
+        alpha_bars = signal / signal_at_zero
+        previous_alpha_bars = np.concatenate([[1.0], alpha_bars[:-1]])
+
+        self.betas = np.clip(1.0 - alpha_bars / previous_alpha_bars, 0.0, 0.999).astype(np.float32)
+        self.alphas = 1.0 - self.betas
+        self.alpha_bars = np.cumprod(self.alphas)
+
+    def alpha_bar(self, timestep: int) -> float:
+        # timestep -1 stands for the clean image (alpha_bar = 1): DDIM's final target.
+        return float(self.alpha_bars[timestep]) if timestep >= 0 else 1.0
+
+    def ddpm_step(self, noisy: np.ndarray, predicted_noise: np.ndarray, timestep: int,
+                  rng: np.random.Generator) -> np.ndarray:
+        """One stochastic DDPM step: timestep -> timestep - 1."""
+        alpha = self.alphas[timestep]
+        noise_scale = (1.0 - alpha) / np.sqrt(1.0 - self.alpha_bars[timestep])
+        mean = (1.0 / np.sqrt(alpha)) * (noisy - noise_scale * predicted_noise)
+        fresh_noise = rng.standard_normal(noisy.shape).astype(np.float32)
+        add_noise = 1.0 if timestep > 0 else 0.0  # the last step adds none
+        return (mean + add_noise * np.sqrt(self.betas[timestep]) * fresh_noise).astype(np.float32)
+
+    def ddim_step(self, noisy: np.ndarray, predicted_noise: np.ndarray, timestep: int,
+                  next_timestep: int, rng: np.random.Generator, eta: float = 0.0) -> np.ndarray:
+        """One DDIM step (Song et al. 2021). It can jump many timesteps at once,
+        which is what makes DDIM few-step."""
+        alpha_bar = self.alpha_bar(timestep)
+        next_alpha_bar = self.alpha_bar(next_timestep)
+
+        # Estimate the clean image, then re-noise it to the next timestep's level.
+        clean = (noisy - np.sqrt(1.0 - alpha_bar) * predicted_noise) / np.sqrt(alpha_bar)
+        clean = np.clip(clean, -1.0, 1.0)  # trained on [-1, 1]; keeps early steps stable
+
+        sigma = 0.0
+        if eta > 0.0:
+            sigma = (eta * np.sqrt((1.0 - next_alpha_bar) / (1.0 - alpha_bar))
+                     * np.sqrt(1.0 - alpha_bar / next_alpha_bar))
+        noise_direction = np.sqrt(max(1.0 - next_alpha_bar - sigma ** 2, 0.0))
+        result = np.sqrt(next_alpha_bar) * clean + noise_direction * predicted_noise
+        if sigma > 0.0 and next_timestep > 0:
+            result = result + sigma * rng.standard_normal(noisy.shape).astype(np.float32)
+        return result.astype(np.float32)
+
+
+class DiffusionModel:
+    """An ONNX noise-prediction model together with the schedule it was trained on."""
+
+    def __init__(self, path: Path, timesteps: int, providers: tuple[str, ...],
+                 is_upsampler: bool):
+        self.session = _load_session(path, providers)
+        self.schedule = NoiseSchedule(timesteps)
+        self.is_upsampler = is_upsampler
+
+        expected = {"image_input", "time_input", "label_input"}
+        if is_upsampler:
+            expected.add("blur_input")
+        actual = {model_input.name for model_input in self.session.get_inputs()}
+        if missing := expected - actual:
+            raise ValueError(f"{path.name} is missing inputs {missing}; has {actual}")
+
+    def predict_noise(self, images: np.ndarray, timestep: int, labels: np.ndarray,
+                      guide: np.ndarray | None = None) -> np.ndarray:
+        batch_size = labels.shape[0]
+        inputs = {
+            "image_input": images,
+            "time_input": np.full((batch_size, 1), float(timestep), dtype=np.float32),
+            "label_input": labels,
+        }
+        if self.is_upsampler:
+            # The upsampler sees noise and guide stacked as 6 channels. blur_input is
+            # the guide's blur level from training augmentation: 0 = clean guide.
+            inputs["image_input"] = np.concatenate([images, guide], axis=-1)
+            inputs["blur_input"] = np.zeros((batch_size, 1), dtype=np.float32)
+        return self.session.run(None, inputs)[0]
+
+
 class CascadePipeline:
     def __init__(self, config: CascadeConfig = CascadeConfig()):
-        self.cfg = config
-        self.base_sess = self._make_session(config.base_model)
-        self.up_sess = self._make_session(config.up_model)
-        self.base_sched = Schedule(config.base_timesteps)
-        self.up_sched = Schedule(config.up_timesteps)
-        self._base_inputs = {i.name for i in self.base_sess.get_inputs()}
-        self._up_inputs = {i.name for i in self.up_sess.get_inputs()}
-        _require({"image_input", "time_input", "label_input"}, self._base_inputs, "base")
-        _require({"image_input", "time_input", "blur_input", "label_input"},
-                 self._up_inputs, "upsampler")
+        self.config = config
+        self.base_model = DiffusionModel(config.base_model_path, config.base_timesteps,
+                                         config.providers, is_upsampler=False)
+        self.upsample_model = DiffusionModel(config.upsample_model_path, config.upsample_timesteps,
+                                             config.providers, is_upsampler=True)
 
-    def _make_session(self, model_path: Path) -> rt.InferenceSession:
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"ONNX model not found: {model_path}. Run export_onnx.py first."
-            )
-        available = set(rt.get_available_providers())
-        providers = [p for p in self.cfg.providers if p in available]
-        if "CPUExecutionProvider" not in providers:
-            providers.append("CPUExecutionProvider")
-
-        # Pin the optimization level. The Python SessionOptions default is
-        # ORT_ENABLE_ALL, whose layout optimizations MISCOMPILE the fp16 upsampler on
-        # onnxruntime 1.28/aarch64: it produces a Gather over an empty tensor
-        # ("indices element out of data bounds ... range [0,-1]") and fails on the
-        # first forward pass. EXTENDED keeps every fusion that matters and is stable.
-        # Never rely on the default here — it changes between ORT releases.
-        so = rt.SessionOptions()
-        so.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        try:
-            sess = rt.InferenceSession(str(model_path), so, providers=providers)
-        except Exception as exc:
-            # Some EPs (e.g. CoreML) fail to compile certain dynamic-shape graphs.
-            # Degrade to CPU rather than crash the whole pipeline.
-            logger.warning("%s failed on %s (%s); falling back to CPU",
-                           model_path.name, providers[0], type(exc).__name__)
-            sess = rt.InferenceSession(str(model_path), so,
-                                       providers=["CPUExecutionProvider"])
-        logger.info("loaded %s on %s", model_path.name, sess.get_providers()[0])
-        return sess
-
-    def _predict_noise(self, sess, x, t, labels, cond, blur):
-        """One model forward pass at timestep t for the whole batch."""
-        t_arr = np.full((labels.shape[0], 1), float(t), dtype=np.float32)
-        model_in = x if cond is None else np.concatenate([x, cond], axis=-1)
-        feed = {"image_input": model_in, "time_input": t_arr, "label_input": labels}
-        if cond is not None:
-            feed["blur_input"] = blur
-        return sess.run(None, feed)[0]
-
-    def _sample(self, sess, sched, x, labels, cond, rng, desc, should_cancel=None,
-                steps=None):
-        """Reverse-diffuse `x` to a clean image using the configured sampler.
-
-        Both samplers stop before a true t=0 step: the cosine schedule has
-        alpha_bar[0]==1, so a t=0 DDPM step divides by sqrt(1-alpha_bar_0)=0.
-        DDIM instead targets t_prev=-1 (the clean image, alpha_bar=1) on its last step.
-
-        `should_cancel`, if given, is polled between steps; when it returns True the
-        loop raises JobCancelled so the caller can stop a superseded job cheaply
-        (bounded to one denoising step of latency — no process kill).
-        """
-        cfg = self.cfg
-        blur = np.zeros((labels.shape[0], 1), dtype=np.float32)  # clean guide at inference
-        steps = cfg.ddim_steps if steps is None else steps
-
-        if cfg.sampler == "ddim":
-            # Descending subsequence of timesteps: T-1 -> 0, `ddim_steps` hops.
-            times = np.linspace(sched.timesteps - 1, 0, steps + 1).round().astype(int)
-            for i in range(steps):
-                if should_cancel and should_cancel():
-                    raise JobCancelled(f"{desc} cancelled at ddim step {i}")
-                t, t_prev = int(times[i]), int(times[i + 1])
-                if t == t_prev:
-                    continue  # can happen if steps ~ timesteps; skip no-op hop
-                eps = self._predict_noise(sess, x, t, labels, cond, blur)
-                # Last hop targets the clean image (t_prev=-1) instead of t=0.
-                x = sched.ddim_step(x, eps, t, t_prev if i < steps - 1 else -1,
-                                    rng, cfg.ddim_eta)
-                logger.debug("%s ddim %d/%d", desc, i + 1, steps)
-        elif cfg.sampler == "ddpm":
-            for i in range(sched.timesteps - 1):
-                # Poll every 20 steps: 1000-step DDPM shouldn't hammer Redis.
-                if should_cancel and i % 20 == 0 and should_cancel():
-                    raise JobCancelled(f"{desc} cancelled at ddpm step {i}")
-                t = sched.timesteps - i - 1
-                eps = self._predict_noise(sess, x, t, labels, cond, blur)
-                x = sched.ddpm_step(x, eps, t, rng)
-                if i % 100 == 0:
-                    logger.debug("%s ddpm %d/%d", desc, i, sched.timesteps - 1)
-        else:
-            raise ValueError(f"unknown sampler {cfg.sampler!r}; use 'ddpm' or 'ddim'")
-        return x
-
-    def generate(self, labels: list[int], seed: int | None = None,
-                 should_cancel=None, on_stage=None) -> CascadeResult:
-        """Run the full cascade for a batch of class ids in a single pass per stage.
-
-        `should_cancel`: optional no-arg callable polled between denoising steps;
-        raise-based cooperative cancellation (see `_sample`).
-        `on_stage`: optional (stage_name, seconds) callback per cascade stage, so a
-        caller can record timings without this module knowing about metrics.
-        """
+    def generate(self, labels: list[int], seed: int | None = None) -> CascadeResult:
+        """Generate one 256x256 image per class label. Same seed -> same images."""
         if not labels:
             raise ValueError("labels must be a non-empty list of class ids")
-        cfg = self.cfg
-        timer = _stage_timer(on_stage)
+        config = self.config
         rng = np.random.default_rng(seed)
-        lab = np.asarray(labels, dtype=np.float32).reshape(-1, 1)
-        n = lab.shape[0]
+        label_batch = np.asarray(labels, dtype=np.float32).reshape(-1, 1)
 
-        logger.info("[stage 1] base %dx%d, %d image(s), sampler=%s", cfg.base_image_size,
-                    cfg.base_image_size, n, cfg.sampler)
-        x = rng.standard_normal(
-            (n, cfg.base_image_size, cfg.base_image_size, cfg.channels)
-        ).astype(np.float32)
-        with timer("base"):
-            base = self._sample(self.base_sess, self.base_sched, x, lab, None, rng, "base",
-                                should_cancel, steps=cfg.ddim_steps)
+        logger.info("[stage 1] base %dpx, %d image(s), sampler=%s",
+                    config.base_image_size, len(labels), config.sampler)
+        noise = _gaussian_noise(rng, len(labels), config.base_image_size)
+        base_images = self._denoise(self.base_model, noise, label_batch,
+                                    config.base_steps, rng)
 
-        with timer("condition"):
-            cond = np.stack([bicubic_resize(base[i], cfg.up_image_size) for i in range(n)])
+        logger.info("[stage 2] upsample -> %dpx", config.upsample_image_size)
+        guide = np.stack([bicubic_resize(image, config.upsample_image_size)
+                          for image in base_images])
+        noise = _gaussian_noise(rng, len(labels), config.upsample_image_size)
+        images = self._denoise(self.upsample_model, noise, label_batch,
+                               config.upsample_steps, rng, guide)
 
-        logger.info("[stage 2] upsample -> %dx%d, sampler=%s", cfg.up_image_size,
-                    cfg.up_image_size, cfg.sampler)
-        x = rng.standard_normal(
-            (n, cfg.up_image_size, cfg.up_image_size, cfg.channels)
-        ).astype(np.float32)
-        with timer("upsample"):
-            final = self._sample(self.up_sess, self.up_sched, x, lab, cond, rng, "upsample",
-                                 should_cancel, steps=cfg.up_steps_effective)
+        return CascadeResult(labels=list(labels), base_images=base_images, images=images)
 
-        return CascadeResult(labels=list(labels), base=base, condition=cond, final=final)
+    def _denoise(self, model: DiffusionModel, images: np.ndarray, labels: np.ndarray,
+                 ddim_steps: int, rng: np.random.Generator,
+                 guide: np.ndarray | None = None) -> np.ndarray:
+        """Run the reverse diffusion from pure noise to a clean image.
+
+        Neither sampler takes a real t=0 step: the cosine schedule has alpha_bar[0] = 1,
+        which would divide by zero. DDIM's last step targets -1 (the clean image) instead.
+        """
+        schedule = model.schedule
+
+        if self.config.sampler == "ddpm":
+            for timestep in range(schedule.timesteps - 1, 0, -1):
+                predicted_noise = model.predict_noise(images, timestep, labels, guide)
+                images = schedule.ddpm_step(images, predicted_noise, timestep, rng)
+            return images
+
+        # DDIM: `ddim_steps` evenly spaced jumps from the last timestep down to 0.
+        timesteps = np.linspace(schedule.timesteps - 1, 0, ddim_steps + 1).round().astype(int)
+        for step in range(ddim_steps):
+            timestep, next_timestep = int(timesteps[step]), int(timesteps[step + 1])
+            if timestep == next_timestep:
+                continue  # rounding duplicate when ddim_steps is close to timesteps
+            if step == ddim_steps - 1:
+                next_timestep = -1  # land on the clean image
+            predicted_noise = model.predict_noise(images, timestep, labels, guide)
+            images = schedule.ddim_step(images, predicted_noise, timestep, next_timestep,
+                                        rng, self.config.ddim_eta)
+        return images
 
 
-def _require(needed: set[str], present: set[str], name: str) -> None:
-    missing = needed - present
-    if missing:
-        raise ValueError(f"{name} model is missing inputs {missing}; got {present}")
+def bicubic_resize(image: np.ndarray, size: int) -> np.ndarray:
+    """Resize one HWC float image, channel by channel in Pillow's float mode so
+    values stay in [-1, 1] instead of being quantised to uint8."""
+    resized = np.empty((size, size, image.shape[-1]), dtype=np.float32)
+    for channel in range(image.shape[-1]):
+        plane = Image.fromarray(image[..., channel], mode="F")
+        resized[..., channel] = np.asarray(plane.resize((size, size), Image.BICUBIC),
+                                           dtype=np.float32)
+    return resized
 
 
-# --------------------------------------------------------------------------- #
-# Entry point — configure here, no CLI
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def to_uint8(image: np.ndarray) -> np.ndarray:
+    """One HWC image in [-1, 1] -> uint8 pixels in [0, 255]."""
+    return (np.clip((image + 1.0) / 2.0, 0.0, 1.0) * 255.0).round().astype(np.uint8)
 
-    config = CascadeConfig()
-    labels = [0, 1]          # 0 = dog, 1 = cat
-    seed = 42
-    out_dir = SCRIPT_DIR / "cascade_output"
 
-    pipe = CascadePipeline(config)
-    result = pipe.generate(labels=labels, seed=seed)
-    result.save(out_dir)
+def _gaussian_noise(rng: np.random.Generator, batch_size: int, image_size: int) -> np.ndarray:
+    return rng.standard_normal((batch_size, image_size, image_size, CHANNELS)).astype(np.float32)
+
+
+def _load_session(path: Path, preferred_providers: tuple[str, ...]) -> ort.InferenceSession:
+    if not path.exists():
+        raise FileNotFoundError(f"ONNX model not found: {path}. Run scripts/export_onnx.py first.")
+
+    available = set(ort.get_available_providers())
+    providers = [provider for provider in preferred_providers if provider in available]
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+
+    # Pin the optimisation level; never rely on the default. ORT_ENABLE_ALL (the default)
+    # miscompiles the fp16 upsampler on onnxruntime 1.28/aarch64 ("indices element out
+    # of data bounds" on the first run). EXTENDED keeps the fusions that matter.
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    try:
+        session = ort.InferenceSession(str(path), options, providers=providers)
+    except Exception as error:
+        # A GPU provider can fail to compile a graph; degrade to CPU instead of crashing.
+        logger.warning("%s failed on %s (%s); falling back to CPU",
+                       path.name, providers[0], type(error).__name__)
+        session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
+    logger.info("loaded %s on %s", path.name, session.get_providers()[0])
+    return session
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    result = CascadePipeline().generate(labels=[DOG, CAT], seed=42)
+    paths = result.save(Path(__file__).resolve().parent / "cascade_output")
+    logger.info("saved %s", ", ".join(map(str, paths)))

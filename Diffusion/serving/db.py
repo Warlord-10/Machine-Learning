@@ -1,18 +1,17 @@
 """Durable source of truth: the `jobs` and `images` tables.
 
-Redis is a best-effort cache in front of this; the DB is authoritative for
-terminal state. SQLite by default (swap DB_URL for Postgres in prod).
+Redis is a best-effort cache in front of this; Postgres is authoritative for
+job state.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 
-from sqlalchemy import (JSON, DateTime, ForeignKey, String, UniqueConstraint,
-                        create_engine, func)
-from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column, relationship,
-                            sessionmaker)
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from config import DB_URL
 
@@ -22,8 +21,8 @@ PENDING, STARTED, SUCCESS, FAILED, CANCELLED = (
     "pending", "started", "success", "failed", "cancelled")
 TERMINAL = {SUCCESS, FAILED, CANCELLED}
 
-engine = create_engine(DB_URL, future=True)
-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+engine = create_async_engine(DB_URL)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):
@@ -61,18 +60,12 @@ class Image(Base):
     job: Mapped["Job"] = relationship(back_populates="images")
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
 
-@contextmanager
-def session_scope():
-    s = SessionLocal()
-    try:
+@asynccontextmanager
+async def session_scope():
+    async with SessionLocal() as s, s.begin():
         yield s
-        s.commit()
-    except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()

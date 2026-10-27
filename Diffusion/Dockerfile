@@ -18,9 +18,10 @@ WORKDIR /app/serving
 
 ENV PYTHONUNBUFFERED=1 \
     REDIS_URL=redis://redis:6379/0 \
+    RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/ \
     STORAGE_DIR=/data/bucket
-# DB_URL comes from compose (Postgres); config.py falls back to local SQLite.
+# DB_URL comes from compose (it carries the Postgres password).
 
-# ponytail: no entrypoint script — compose overrides `command` for the worker.
+# ponytail: no entrypoint script — compose sets `command: python rabbitmq.py` for the worker.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--forwarded-allow-ips", "*"]
